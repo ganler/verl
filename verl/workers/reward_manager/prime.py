@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import cpu_count
 from functools import partial
 
 import torch
@@ -48,26 +49,16 @@ async def parallel_compute_score_async(evaluation_func,
                                        references,
                                        tasks,
                                        extra_info=None,
-                                       num_processes=64):
+                                       num_processes=cpu_count()):
     scores = []
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
-        if extra_info is None:
-            extra_info = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=num_processes) as executor:
         # Create tasks for all rows
         tasks_async = [
             single_compute_score(evaluation_func, completion, reference, task, task_extra_info, executor, timeout=300.)
             for completion, reference, task, task_extra_info in zip(completions, references, tasks, extra_info)
         ]
         # to prevent very occasional starvation caused by some anomalous programs ( like infinite loop ), the exceptions in async programs will instantly halt the evaluation, and all summoned processes will be killed.
-        try:
-            results = await asyncio.gather(*tasks_async, return_exceptions=False)
-        except:
-            for pid, proc in executor._processes.items():
-                try:
-                    proc.kill()
-                except Exception as kill_err:
-                    print('shut down failed: ' + str(kill_err))
-            raise
+        results = await asyncio.gather(*tasks_async, return_exceptions=False)
 
     # Process results
     for result, completion, reference, task in zip(results, completions, references, tasks):
@@ -110,7 +101,7 @@ class PrimeRewardManager:
                                              sequences_str,
                                              ground_truth,
                                              data_sources,
-                                             num_processes=64))
+                                             num_processes=cpu_count()))
         except asyncio.TimeoutError as e:
             print('Global timeout in reward computing! Setting all as 0.')
             scores = [0. for _ in range(len(sequences_str))]
