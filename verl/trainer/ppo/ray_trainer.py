@@ -24,6 +24,7 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
+from collections import defaultdict
 
 import ray
 import numpy as np
@@ -241,7 +242,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 def _timer(name: str, timing_raw: Dict[str, float]):
     with Timer(name=name, logger=None) as timer:
         yield
-    timing_raw[name] = timer.last
+    timing_raw[name] += timer.last
 
 
 class RayPPOTrainer(object):
@@ -313,6 +314,14 @@ class RayPPOTrainer(object):
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+
+        filter_cfg = config.algorithm.filter_groups
+        if filter_cfg.enable:
+            assert filter_cfg.max_num_gen_batches > 0, f"{filter_cfg.max_num_gen_batches=}"
+            assert config.data.gen_batch_size >= config.data.train_batch_size
+        else:
+            assert config.data.train_batch_size == config.data.gen_batch_size, \
+                f"train_batch_size must be equal to gen_batch_size when filter_groups.enable is False, but got {config.data.train_batch_size =} and {config.data.gen_batch_size =}"
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
@@ -424,12 +433,13 @@ class RayPPOTrainer(object):
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
-        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.train_batch_size,
-                                                   num_workers=8,
-                                                   drop_last=True,
-                                                   collate_fn=collate_fn,
-                                                   sampler=sampler)
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.gen_batch_size,  # hardcode the 2x
+            num_workers=8,
+            drop_last=True,
+            collate_fn=collate_fn,
+            sampler=sampler)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
@@ -790,12 +800,18 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         last_val_metrics = None
 
+        timing_raw = defaultdict(float)
+        accumulated_batch = None
+        num_cumulated_nonzero_prompt = 0  # Num of prompts to accumulate non-equal-reward groups
+        num_checked_prompt_per_step = 0
+        num_substep_prompt_cumulation = 0  # Num of additional batched sampling to accumulate non-equal-reward groups
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_idx, batch_dict in enumerate(self.train_dataloader):
                 metrics = {}
-                timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                num_substep_prompt_cumulation += 1
+                num_checked_prompt_per_step += len(batch.batch)
 
                 # pop those keys for generation
                 if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
@@ -838,6 +854,58 @@ class RayPPOTrainer(object):
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # move reward calculaiton in sub-steps
+                    with _timer("reward", timing_raw):
+                        # compute scores. Support both model and function-based.
+                        # We first compute the scores using reward model. Then, we call reward_fn to combine
+                        # the results from reward model and rule-based results.
+                        if self.use_rm:
+                            # we first compute reward model score
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
+
+                        # we combine with rule-based rm
+                        reward_tensor = self.reward_fn(batch)
+                        batch.batch['token_level_scores'] = reward_tensor
+
+                        # compute rewards. apply_kl_penalty if available
+                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                            batch, kl_metrics = apply_kl_penalty(batch,
+                                                                 kl_ctrl=self.kl_ctrl,
+                                                                 kl_penalty=self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+
+                    # NOTE: DAPO's implementation seem to cause some sample wastes
+                    if self.config.algorithm.filter_groups.enable:
+                        # Collect the sequence reward for each trajectory
+                        prompt_uid2metric_vals = defaultdict(list)
+                        for uid, metric_val in zip(batch.non_tensor_batch['uid'], batch.batch['acc']):
+                            prompt_uid2metric_vals[uid].append(metric_val)
+
+                        prompt_uid2metric_std = {}
+                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
+                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
+
+                        kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 1e-5]
+                        num_cumulated_nonzero_prompt += len(kept_prompt_uids)
+                        kept_traj_idxs = []
+                        for idx, traj_from_prompt_uid in enumerate(batch.non_tensor_batch['uid']):
+                            if traj_from_prompt_uid in kept_prompt_uids:
+                                kept_traj_idxs.append(idx)
+
+                        batch = batch[kept_traj_idxs]
+                        accumulated_batch = DataProto.concat([accumulated_batch, batch]) if accumulated_batch else batch
+
+                        if num_cumulated_nonzero_prompt < self.config.data.train_batch_size:
+                            if num_substep_prompt_cumulation < self.config.algorithm.filter_groups.max_num_gen_batches:
+                                print(f'{num_substep_prompt_cumulation=}. Keep generating...')
+                                continue
+
+                        # Align the batch
+                        traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                        batch = accumulated_batch[:traj_bsz]  # rename back
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
@@ -865,27 +933,6 @@ class RayPPOTrainer(object):
                             batch = batch.union(values)
 
                     with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
@@ -928,6 +975,21 @@ class RayPPOTrainer(object):
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                # how many substeps to accumulate all these -- lower more efficient
+                metrics["train/num_substep_prompt_cumulation"] = num_substep_prompt_cumulation
+                metrics["train/num_checked_prompt_per_step"] = num_checked_prompt_per_step
+                metrics["train/ratio_nonzero_propmt"] = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
+                metrics["train/ratio_trained_prompt"] = self.config.data.train_batch_size / num_checked_prompt_per_step
+                metrics["train/ratio_total_progress"] = (
+                    epoch + (batch_idx + 1) / len(self.train_dataloader)) / self.config.trainer.total_epochs
+
+                # reset
+                timing_raw = defaultdict(float)
+                accumulated_batch = None
+                num_cumulated_nonzero_prompt = 0
+                num_checked_prompt_per_step = 0
+                num_substep_prompt_cumulation = 0
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

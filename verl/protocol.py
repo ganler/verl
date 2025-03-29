@@ -195,9 +195,66 @@ class DataProto:
             return 0
 
     def __getitem__(self, item):
-        tensor_data = self.batch[item]
-        non_tensor_data = {key: val[item] for key, val in self.non_tensor_batch.items()}
-        return DataProtoItem(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
+        # Case 1: Slice object - use the slice method
+        if isinstance(item, slice):
+            return self.slice(item.start, item.stop, item.step)
+
+        # Case 2: List, numpy array, or torch tensor - use sel_idxs
+        elif isinstance(item, (list, np.ndarray, torch.Tensor)):
+            return self.select_idxs(item)
+
+        # Case 3: Single integer - return DataProtoItem for backward compatibility
+        elif isinstance(item, (int, np.integer)):
+            tensor_data = self.batch[item]
+            non_tensor_data = {key: val[item] for key, val in self.non_tensor_batch.items()}
+            return DataProtoItem(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
+
+        raise TypeError(f"Indexing with {type(item)} is not supported")
+
+    def select_idxs(self, idxs):
+        if isinstance(idxs, list):
+            idxs = torch.tensor(idxs, dtype=torch.int32)
+
+        if isinstance(idxs, np.ndarray):
+            idxs_np = idxs
+            idxs_torch = torch.from_numpy(idxs)
+        else:  # torch.Tensor
+            idxs_torch = idxs
+            idxs_np = idxs.detach().cpu().numpy()
+
+        if self.batch is not None:
+            # Use TensorDict's built-in indexing capabilities
+            selected_batch = TensorDict(source={
+                key: tensor[idxs_torch] for key, tensor in self.batch.items()
+            },
+                                        batch_size=(idxs_torch.shape[0],))
+        else:
+            selected_batch = None
+
+        selected_non_tensor = {}
+        for key, val in self.non_tensor_batch.items():
+            selected_non_tensor[key] = val[idxs_np]
+
+        return DataProto(batch=selected_batch, non_tensor_batch=selected_non_tensor, meta_info=self.meta_info)
+
+    def slice(self, start=None, end=None, step=None):
+        # Create a slice object
+        slice_obj = slice(start, end, step)
+
+        # Handle the batch data
+        if self.batch is not None:
+            # Use TensorDict's built-in slicing capabilities
+            sliced_batch = self.batch[slice_obj]
+        else:
+            sliced_batch = None
+
+        # Handle the non-tensor batch data
+        sliced_non_tensor = {}
+        for key, val in self.non_tensor_batch.items():
+            sliced_non_tensor[key] = val[slice_obj]
+
+        # Return a new DataProto object
+        return DataProto(batch=sliced_batch, non_tensor_batch=sliced_non_tensor, meta_info=self.meta_info)
 
     def __getstate__(self):
         import io
@@ -603,7 +660,7 @@ import ray
 class DataProtoFuture:
     """
     DataProtoFuture aims to eliminate actual data fetching on driver. By doing so, the driver doesn't have to wait
-    for data so that asynchronous execution becomes possible. 
+    for data so that asynchronous execution becomes possible.
     DataProtoFuture contains a list of futures from another WorkerGroup of size world_size.
     - collect_fn is a Callable that reduces the list of futures to a DataProto
     - dispatch_fn is a Callable that partitions the DataProto into a list of DataProto of size world_size and then select
