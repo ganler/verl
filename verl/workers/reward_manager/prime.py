@@ -129,7 +129,6 @@ class PrimeRewardManager:
         valid_response_length = data.batch['attention_mask'][:, prompt_length:].sum(dim=-1)
         # sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
         data_sources = data.non_tensor_batch['data_source']
-        # extra_info = data.non_tensor_batch.get('extra_info', [None] * len(data_sources))
 
         scores = self.verify(data)
 
