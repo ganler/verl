@@ -229,6 +229,124 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] += timer.last
 
 
+# NOTE(yuxiang)
+# I need a multiturn queue or something that maintains (1) prompts that need further generation
+# and (2) prompts whose generation are delayed due to multiturn prompts.
+# It needs to implement a method that replace parts of the input batch_dict with multiturn prompts.
+from collections import deque
+from typing import Any
+
+@dataclass
+class MultiTurnPromptManager:
+    """
+    Maintains:
+        1) A queue of multi-turn prompts that still need to be continued in future batches.
+        2) A cache of single-turn prompts that can be re-used for partially filling the batch.
+    """
+    # For incomplete multi-turn prompts from previous steps
+    multiturn_queue: deque[dict] = field(default_factory=deque)
+    # For storing single-turn prompts that have been replaced in prior steps
+    singleturn_cache: deque[dict] = field(default_factory=deque)
+
+    def replace_prompts(self, batch_dict: dict[str, list]) -> dict[str, list]:
+        """
+        1) If we have N multi-turn prompts in the queue, then we replace the LAST min(N, batch_size)
+           items in `batch_dict` with the first min(N, batch_size) items from `multiturn_queue`.
+           - Also, we take those replaced batch items and store them in `singleturn_cache`.
+        2) For the remaining front of the batch, we replace up to that many from `singleturn_cache`.
+           - Again, replaced original items are stored back into `singleturn_cache`.
+        3) Return the modified `batch_dict`.
+
+        NOTE: This assumes `batch_dict` has lists or tensors of the same length (batch_size).
+              If they are PyTorch tensors, you should convert them to lists or carefully slice them.
+        """
+
+        batch_size = len(batch_dict["input_ids"])
+        # --------------
+        # Step 1: Replace the LAST K = min(len(multiturn_queue), batch_size) items with multi-turn prompts
+        # --------------
+
+        K = min(len(self.multiturn_queue), batch_size)
+        # We'll operate on indices from (batch_size - K) to (batch_size-1)
+        for idx_offset in range(K):
+            idx = batch_size - 1 - idx_offset  # from the end going backwards
+
+            # Pop an item from multi-turn queue
+            multiturn_item = self.multiturn_queue.popleft()
+
+            # Save original batch item to single-turn cache
+            original_item = self._extract_batch_item(batch_dict, idx)
+            self.singleturn_cache.append(original_item)
+
+            # Insert the multi-turn item into the batch
+            self._put_batch_item(batch_dict, idx, multiturn_item)
+
+        # --------------
+        # Step 2: For the FRONT M-K items, try replacing them from singleturn_cache
+        # --------------
+
+        remaining_front = batch_size - K
+        L = min(len(self.singleturn_cache), remaining_front)
+
+        # Replace the FIRST L items in the batch
+        for idx in range(L):
+            singleturn_item = self.singleturn_cache.popleft()
+
+            # Save original batch item to single-turn cache
+            original_item = self._extract_batch_item(batch_dict, idx)
+            self.singleturn_cache.append(original_item)
+
+            # Insert the single-turn item into the batch
+            self._put_batch_item(batch_dict, idx, singleturn_item)
+
+        # The middle portion (from L to remaining_front) remains untouched
+        # The last portion (already replaced with multi-turn) remains as is.
+
+        return batch_dict
+
+    def update_multiturn_prompts(self, new_prompts: list[dict[str, Any]]) -> None:
+        """
+        Append new incomplete multi-turn prompts to the queue for use in future batches.
+        Typically called after generation steps when we identify incomplete dialogues.
+        """
+        for prompt in new_prompts:
+            self.multiturn_queue.append(prompt)
+
+    @staticmethod
+    def _extract_batch_item(batch_dict: dict[str, list], idx: int) -> dict[str, Any]:
+        """
+        Take a snapshot of the 'idx'-th item from each list/tensor in batch_dict.
+        Return it as a dictionary that can be re-injected later.
+        """
+        item = {}
+        for key, val_list in batch_dict.items():
+            if isinstance(val_list, list):
+                item[key] = val_list[idx]
+            else:
+                # If they're Tensors, do slice operation.
+                # For instance: item[key] = val_list[idx].clone()
+                # Here we assume a 1D or ND tensor with batch dimension = 0
+                item[key] = val_list[idx]
+        return item
+
+    @staticmethod
+    def _put_batch_item(batch_dict: dict[str, list], idx: int, item: dict[str, Any]) -> None:
+        """
+        Place the given 'item' into the 'idx'-th position of each list/tensor in batch_dict.
+        """
+        for key, val_list in batch_dict.items():
+            if key in item:
+                if isinstance(val_list, list):
+                    val_list[idx] = item[key]
+                else:
+                    # If they're Tensors, we do an assignment:
+                    # val_list[idx] = item[key]
+                    val_list[idx] = item[key]
+            else:
+                # If 'item' does not have this key, we skip or fill with default
+                pass
+
+
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -248,6 +366,7 @@ class RayPPOTrainer(object):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
+        self.multiturn_prompt_manager = MultiTurnPromptManager()
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
@@ -424,6 +543,12 @@ class RayPPOTrainer(object):
             drop_last=True,
             collate_fn=collate_fn,
             sampler=sampler)
+
+        # with open("tmp1.pkl", "wb") as f:
+        #     for batch_idx, batch_dict in enumerate(self.train_dataloader):
+        #         import pickle
+        #         pickle.dump(batch_dict, f)
+        #         exit()
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
@@ -809,6 +934,10 @@ class RayPPOTrainer(object):
             for batch_idx, batch_dict in enumerate(self.train_dataloader):
                 metrics = {}
 
+                # NOTE(yuxiang): replace a subset of prompts with newly generated multiturn prompts
+                # and postpone the replaced prompts to later batches
+                batch_dict = self.multiturn_prompt_manager.replace_prompts(batch_dict)
+
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_substep_prompt_cumulation += 1
                 num_checked_prompt_per_step += len(batch.batch)
@@ -831,6 +960,9 @@ class RayPPOTrainer(object):
                     # generate a batch
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                    
+                    # XXX(yuxiang): implement the multiturn enqueue logic here
+                    # self.multiturn_prompt_manager.update_multiturn_prompts(...)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer('gen_max', timing_raw):
