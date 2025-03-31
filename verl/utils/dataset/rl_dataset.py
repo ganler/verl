@@ -14,10 +14,11 @@
 
 from omegaconf import ListConfig
 import os
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Any
 import copy
 import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 
 import torch
 import numpy as np
@@ -43,7 +44,9 @@ def collate_fn(data_list: list[dict]) -> dict:
         tensors[key] = torch.stack(val, dim=0)
 
     for key, val in non_tensors.items():
-        non_tensors[key] = np.array(val, dtype=object)
+        obj_array = np.empty(len(val), dtype=object)
+        obj_array[:] = val
+        non_tensors[key] = obj_array
 
     return {**tensors, **non_tensors}
 
@@ -121,6 +124,7 @@ class RLHFDataset(Dataset):
         for i, parquet_file in enumerate(parquet_files):
             self.parquet_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir)
 
+
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.parquet_files:
@@ -136,6 +140,7 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
             self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
+                # XXX: consider multiturn
                 tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
                                                                  axis=1)]
 
@@ -150,6 +155,47 @@ class RLHFDataset(Dataset):
         else:
             print(r'old dataloader ckpt file is used, please train from scratch for better ckpt performance')
 
+
+    @staticmethod
+    def get_actual_userturn_index(messages: list[dict]) -> int:
+        """
+        Returns the index of the first message in the last contiguous block of user messages.
+        If the last message is not a user message, returns -1.
+
+        In a multi-turn conversation, a user may send multiple consecutive messages
+        (e.g. user1, assistant, user2, user3). The function returns the index of the
+        first message of the last contiguous block of user messages (user2 in the example).
+        """
+        assert len(messages) > 0, "Messages should not be empty"
+        assert messages[-1]["role"] == "user", "Last message should be a user message"
+
+        # Search backward to find the last user message
+        i = len(messages) - 1
+        while i > 0 and messages[i - 1]["role"] == "user":
+            i -= 1
+        return i
+
+    def try_create_multiturn_data(
+        self,
+        data_index: int,
+        response: str,
+        raw_prompt: list[dict] | np.ndarray,
+        remaining_prompt: list[dict] | np.ndarray,
+    ) -> dict:
+        """
+        If adding the response won't cause the dialogs to finish, we form a new dialog.
+        """
+        assert len(remaining_prompt) > 0, "Remaining prompt should not be empty"
+        if isinstance(raw_prompt, np.ndarray):
+            raw_prompt = raw_prompt.tolist()
+        if isinstance(remaining_prompt, np.ndarray):
+            remaining_prompt = remaining_prompt.tolist()
+        raw_data = self.dataframe.iloc[data_index].to_dict()
+        new_message = dict(role="assistant", content=response)
+        new_messages = raw_prompt + [new_message] + remaining_prompt
+        raw_data[self.prompt_key] = np.array(new_messages, dtype=object)
+        return raw_data
+
     def __len__(self):
         return len(self.dataframe)
 
@@ -158,10 +204,20 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe.iloc[item].to_dict()
+        return self.process_row(item, row_dict)
 
+    def process_row(self, index: int, row_dict: dict) -> dict:
+        # Let's store the data index to help multiturn construction
+        row_dict["data_index"] = index
         chat = row_dict.pop(self.prompt_key)
+        if isinstance(chat, np.ndarray):
+            chat = chat.tolist()
+        actual_userturn_index = self.get_actual_userturn_index(chat)
+        # Remaining multiturn chat
+        remaining_chat = chat[actual_userturn_index + 1 :]
+        actual_chat = chat[: actual_userturn_index + 1]
 
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+        prompt_with_chat_template = self.tokenizer.apply_chat_template(actual_chat, add_generation_prompt=True, tokenize=False)
 
         is_multi_modal = self.image_key in row_dict
         if is_multi_modal:  # expand image token
@@ -214,7 +270,8 @@ class RLHFDataset(Dataset):
 
         # encode prompts without chat template
         if self.return_raw_chat:
-            row_dict['raw_prompt'] = chat.tolist()
+            row_dict['remaining_prompt'] = remaining_chat
+            row_dict['raw_prompt'] = actual_chat
 
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
@@ -230,3 +287,120 @@ class RLHFDataset(Dataset):
                 del state['dataframe']
             return state
         return self.__dict__.copy()
+
+
+BatchDictType = dict[str, list | torch.Tensor]
+
+
+@dataclass
+class MultiTurnPromptManager:
+    """
+    Maintains:
+        1) A queue of multi-turn prompts that still need to be continued in future batches.
+        2) A cache of single-turn prompts that can be re-used for partially filling the batch.
+    """
+
+    # For incomplete multi-turn prompts from previous steps
+    multiturn_queue: deque[dict] = field(default_factory=deque)
+    # For storing single-turn prompts that have been replaced in prior steps
+    singleturn_cache: deque[dict] = field(default_factory=deque)
+    mandatory_batch_key: str = "input_ids"
+
+    def replace_prompts_inplace(self, batch_dict: BatchDictType) -> None:
+        """
+        1) If we have N multi-turn prompts in the queue, then we replace the LAST min(N, batch_size)
+           items in `batch_dict` with the first min(N, batch_size) items from `multiturn_queue`.
+           - Also, we take those replaced batch items and store them in `singleturn_cache`.
+        2) For the remaining front of the batch, we replace up to that many from `singleturn_cache`.
+           - Again, replaced original items are stored back into `singleturn_cache`.
+        3) Return the modified `batch_dict`.
+
+        NOTE: This assumes `batch_dict` has lists or tensors of the same length (batch_size).
+        """
+
+        batch_size = len(batch_dict[self.mandatory_batch_key])
+        # --------------
+        # Step 1: Replace the FIRST K = min(len(multiturn_queue), batch_size) items with multi-turn prompts
+        # --------------
+
+        K = min(len(self.multiturn_queue), batch_size)
+
+        # Prepare for step 2
+        remaining_replacements = batch_size - K
+        L = min(len(self.singleturn_cache), remaining_replacements)
+
+        # We'll operate on indices from (batch_size - K) to (batch_size-1)
+        for idx in range(K):
+            # Pop an item from multi-turn queue
+            multiturn_item = self.multiturn_queue.popleft()
+
+            # Save original batch item to single-turn cache
+            original_item = self._extract_batch_item(batch_dict, idx)
+            # breakpoint()
+            self.singleturn_cache.append(original_item)
+
+            # Insert the multi-turn item into the batch
+            self._put_batch_item(batch_dict, idx, multiturn_item)
+
+        # --------------
+        # Step 2: For the NEXT L items, try replacing them from singleturn_cache
+        # --------------
+
+        # Replace the FIRST L items in the batch
+        for idx in range(K, K + L):
+            singleturn_item = self.singleturn_cache.popleft()
+
+            # Save original batch item to single-turn cache
+            original_item = self._extract_batch_item(batch_dict, idx)
+            self.singleturn_cache.append(original_item)
+
+            # Insert the single-turn item into the batch
+            self._put_batch_item(batch_dict, idx, singleturn_item)
+
+
+    def update_multiturn_prompts(self, new_prompts: list[dict[str, Any]]) -> None:
+        """
+        Append new incomplete multi-turn prompts to the queue for use in future batches.
+        Typically called after generation steps when we identify incomplete dialogues.
+        """
+        for prompt in new_prompts:
+            self.multiturn_queue.append(prompt)
+
+    @staticmethod
+    def _extract_batch_item(batch_dict: BatchDictType, idx: int) -> dict[str, Any]:
+        """
+        Take a snapshot of the 'idx'-th item from each list/tensor in batch_dict.
+        Return it as a dictionary that can be re-injected later.
+        """
+        return {key: val_list[idx] for key, val_list in batch_dict.items()}
+
+    @staticmethod
+    def _put_batch_item(
+        batch_dict: BatchDictType, idx: int, item: dict[str, Any]
+    ) -> None:
+        """
+        Place the given 'item' into the 'idx'-th position of each list/tensor in batch_dict.
+        """
+        for key in batch_dict.keys():
+            if isinstance(batch_dict[key], torch.Tensor):
+                # Rebuild the entire tensor
+                # Otherwise, the extracted batch item may be affected by the change
+                # as that's just a view of the original tensor.
+                old_shape = batch_dict[key].shape  # type: ignore
+                new_tensor = torch.stack(
+                    [
+                        item[key] if i == idx else batch_dict[key][i]
+                        for i in range(old_shape[0])
+                    ]
+                )
+                assert new_tensor.shape == old_shape
+                batch_dict[key] = new_tensor
+            else:
+                # Replace the list item
+                batch_dict[key][idx] = item[key]
+
+    def queue_status(self) -> str:
+        """
+        Return the number of items in the multiturn_queue and singleturn_cache.
+        """
+        return f"Multiturn queue: {len(self.multiturn_queue)}, Singleturn cache: {len(self.singleturn_cache)}"
