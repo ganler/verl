@@ -40,7 +40,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn, MultiTurnPromptManager
 from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -228,7 +228,6 @@ def _timer(name: str, timing_raw: Dict[str, float]):
         yield
     timing_raw[name] += timer.last
 
-
 class RayPPOTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -248,6 +247,7 @@ class RayPPOTrainer(object):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
+        self.multiturn_prompt_manager = MultiTurnPromptManager()
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
@@ -406,6 +406,8 @@ class RayPPOTrainer(object):
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation=self.config.data.get('truncation', 'error'),
                                          filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        self.multiturn_prompt_manager = MultiTurnPromptManager()
+
         assert self.train_dataset.truncation == self.config.data.get(
             'truncation', 'error'
         ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
@@ -809,6 +811,10 @@ class RayPPOTrainer(object):
             for batch_idx, batch_dict in enumerate(self.train_dataloader):
                 metrics = {}
 
+                # NOTE(yuxiang): replace a subset of prompts with newly generated multiturn prompts
+                # and delay their generation to next steps. This is a no-op for non-multiturn prompts.
+                self.multiturn_prompt_manager.replace_prompts_inplace(batch_dict)
+
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_substep_prompt_cumulation += 1
                 num_checked_prompt_per_step += len(batch.batch)
@@ -853,6 +859,43 @@ class RayPPOTrainer(object):
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # NOTE(yuxiang): the multiturn enqueue logic
+                    with _timer("multiturn_preprocess", timing_raw):
+                        data_indices: list[int] = batch.non_tensor_batch["data_index"]
+                        responses: torch.Tensor = batch.batch["responses"]
+                        for i, data_index in enumerate(data_indices):
+                            if "remaining_prompt" not in batch.non_tensor_batch:
+                                continue
+
+                            remaining_prompt = batch.non_tensor_batch["remaining_prompt"][i]
+                            if len(remaining_prompt) <= 0:
+                                continue
+                            # XXX: inefficient. decoding will happen again during reward_fn
+                            # XXX: strip away <thinking>
+                            response_text = self.tokenizer.decode(
+                                responses[i], skip_special_tokens=True
+                            )
+                            raw_prompt = batch.non_tensor_batch["raw_prompt"][i]
+                            new_data = self.train_dataset.try_create_multiturn_data(
+                                data_index,
+                                response_text,
+                                raw_prompt,
+                                remaining_prompt,
+                            )
+                            try:
+                                new_processed_data = self.train_dataset.process_row(data_index, new_data)
+                            except NotImplementedError as e:
+                                # We skip examples that exceed the maximum sequence length
+                                pprint(f"Exception in processing multiturn prompts (likely seq_len): {str(e)}")
+                                continue
+                            # XXX: now appending all responses for the same prompt. this can lead to exponential
+                            # growth in the number of prompts.
+                            self.multiturn_prompt_manager.update_multiturn_prompts([new_processed_data])
+                            # Currently, we just do a dumb way to add at most one multi-turn prompt per step
+                            break
+                    # Print the queue status
+                    pprint(self.multiturn_prompt_manager.queue_status())
 
                     # move reward calculaiton in sub-steps
                     with _timer("reward", timing_raw):
