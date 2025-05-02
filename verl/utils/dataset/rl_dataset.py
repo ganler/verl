@@ -188,6 +188,9 @@ class RLHFDataset(Dataset):
         else:
             raw_prompt = prompt_with_chat_template
 
+        # add <think> for each prompt
+        # raw_prompt += "<think>"
+        # raw_prompt += "## Analysis\n"
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
                                                                          tokenizer=self.tokenizer,
                                                                          max_length=self.max_prompt_length,

@@ -17,6 +17,7 @@ import torch
 from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
 
+
 class GroupRewardManager:
     """
     The Reward Manager used in https://github.com/PRIME-RL/PRIME

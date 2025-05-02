@@ -299,14 +299,6 @@ class RayPPOTrainer(object):
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
-        filter_cfg = config.algorithm.filter_groups
-        if filter_cfg.enable:
-            assert filter_cfg.max_num_gen_batches > 0, f"{filter_cfg.max_num_gen_batches=}"
-            assert config.data.gen_batch_size >= config.data.train_batch_size
-        else:
-            assert config.data.train_batch_size == config.data.gen_batch_size, \
-                f"train_batch_size must be equal to gen_batch_size when filter_groups.enable is False, but got {config.data.train_batch_size =} and {config.data.gen_batch_size =}"
-
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
         assert real_train_batch_size % n_gpus == 0, \
@@ -810,7 +802,8 @@ class RayPPOTrainer(object):
                 timing_raw = {}
                 num_cumulated_nonzero_prompt = 0
                 num_checked_prompt_per_step = 0
-                estimated_prompt_size = min(self.config.data.train_batch_size * 4, self.config.data.train_batch_size / last_prompt_utilization)
+                estimated_prompt_size = min(self.config.data.train_batch_size * self.config.data.max_roll_factor,
+                                            self.config.data.train_batch_size / last_prompt_utilization)
                 batch_list = []
                 for batch_dict in self.train_dataloader:
                     batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -818,7 +811,7 @@ class RayPPOTrainer(object):
                     num_checked_prompt_per_step += len(batch.batch)
                     if num_checked_prompt_per_step >= estimated_prompt_size:
                         break
-                
+
                 batch = DataProto.concat(batch_list)
 
                 num_total_checked_prompt += num_checked_prompt_per_step
@@ -863,7 +856,7 @@ class RayPPOTrainer(object):
                             del gen_baseline_batch, gen_baseline_output
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                            dtype=object)
+                                                             dtype=object)
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
@@ -885,8 +878,8 @@ class RayPPOTrainer(object):
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
                             batch, kl_metrics = apply_kl_penalty(batch,
-                                                                kl_ctrl=self.kl_ctrl,
-                                                                kl_penalty=self.config.algorithm.kl_penalty)
+                                                                 kl_ctrl=self.kl_ctrl,
+                                                                 kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
@@ -903,13 +896,24 @@ class RayPPOTrainer(object):
                             prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
 
                         kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 1e-5]
-                        num_cumulated_nonzero_prompt += len(kept_prompt_uids)
+                        num_cumulated_nonzero_prompt = len(kept_prompt_uids)
                         kept_traj_idxs = []
                         for idx, traj_from_prompt_uid in enumerate(batch.non_tensor_batch['uid']):
                             if traj_from_prompt_uid in kept_prompt_uids:
                                 kept_traj_idxs.append(idx)
 
                         batch = batch[kept_traj_idxs]
+
+                        metrics["train/num_checked_prompt"] = num_checked_prompt_per_step
+                        metrics["train/num_nonzero_prompt"] = num_cumulated_nonzero_prompt
+                        last_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
+                        metrics["train/ratio_nonzero_propmt"] = last_prompt_utilization
+
+                        if num_cumulated_nonzero_prompt == 0:
+                            print(
+                                f"Warning: No prompt left after filtering, please check your reward function and filter_groups settings."
+                            )
+                            continue
 
                     batch.batch['response_mask'] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -941,10 +945,10 @@ class RayPPOTrainer(object):
                     with _timer('adv', timing_raw):
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
-                                                adv_estimator=self.config.algorithm.adv_estimator,
-                                                gamma=self.config.algorithm.gamma,
-                                                lam=self.config.algorithm.lam,
-                                                num_repeat=self.config.actor_rollout_ref.rollout.n)
+                                                  adv_estimator=self.config.algorithm.adv_estimator,
+                                                  gamma=self.config.algorithm.gamma,
+                                                  lam=self.config.algorithm.lam,
+                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
                     if self.use_critic:
@@ -981,11 +985,6 @@ class RayPPOTrainer(object):
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
-                # how many substeps to accumulate all these -- lower more efficient
-                metrics["train/num_checked_prompt_per_step"] = num_checked_prompt_per_step
-                last_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
-                metrics["train/ratio_nonzero_propmt"] = last_prompt_utilization
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
