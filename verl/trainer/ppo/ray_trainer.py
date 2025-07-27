@@ -253,6 +253,7 @@ class RayPPOTrainer(object):
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.last_prompt_utilization = 1
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -680,6 +681,10 @@ class RayPPOTrainer(object):
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # save prompt utilization rate
+        with open(os.path.join(local_global_step_folder, 'step_prompt_utilization.txt'), 'w') as f:
+            f.write(str(self.last_prompt_utilization))
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
                                                            'latest_checkpointed_iteration.txt')
@@ -719,6 +724,12 @@ class RayPPOTrainer(object):
 
         print(f'Setting global step to {self.global_steps}')
         print(f'Resuming from {global_step_folder}')
+
+        # load prompt utilization rate
+        if os.path.exists(os.path.join(global_step_folder, 'step_prompt_utilization.txt')):
+            with open(os.path.join(global_step_folder, 'step_prompt_utilization.txt'), 'r') as f:
+                self.last_prompt_utilization = float(f.read().strip())
+            print(f'Last prompt utilization from resumed checkpoint: {self.last_prompt_utilization}')
 
         actor_path = os.path.join(global_step_folder, 'actor')
         critic_path = os.path.join(global_step_folder, 'critic')
@@ -793,7 +804,6 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         last_val_metrics = None
 
-        last_prompt_utilization = 1
         is_last_step = False
         for epoch in range(self.config.trainer.total_epochs):
             num_total_checked_prompt = 0
@@ -803,7 +813,7 @@ class RayPPOTrainer(object):
                 num_cumulated_nonzero_prompt = 0
                 num_checked_prompt_per_step = 0
                 estimated_prompt_size = min(self.config.data.train_batch_size * self.config.data.max_roll_factor,
-                                            self.config.data.train_batch_size / last_prompt_utilization)
+                                            self.config.data.train_batch_size / self.last_prompt_utilization)
                 batch_list = []
                 for batch_dict in self.train_dataloader:
                     batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -906,8 +916,8 @@ class RayPPOTrainer(object):
 
                         metrics["train/num_checked_prompt"] = num_checked_prompt_per_step
                         metrics["train/num_nonzero_prompt"] = num_cumulated_nonzero_prompt
-                        last_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
-                        metrics["train/ratio_nonzero_propmt"] = last_prompt_utilization
+                        self.last_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
+                        metrics["train/ratio_nonzero_propmt"] = self.last_prompt_utilization
 
                         if num_cumulated_nonzero_prompt == 0:
                             print(

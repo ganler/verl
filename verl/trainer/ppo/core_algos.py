@@ -296,7 +296,12 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
 
     pg_losses = -advantages * ratio
-    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+
+    clip_low = 1.0 - cliprange
+    assert 1 > clip_low > 0, f'Got unexpected {clip_low = }'
+    clip_high = 1.0 / clip_low
+
+    pg_losses2 = -advantages * torch.clamp(ratio, clip_low, clip_high)
 
     pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
