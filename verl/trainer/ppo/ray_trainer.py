@@ -226,7 +226,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 def _timer(name: str, timing_raw: Dict[str, float]):
     with Timer(name=name, logger=None) as timer:
         yield
-    timing_raw[name] = timer.last
+    timing_raw[name] += timer.last
 
 
 class RayPPOTrainer(object):
@@ -411,7 +411,7 @@ class RayPPOTrainer(object):
             sampler = SequentialSampler(data_source=self.train_dataset)
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.train_batch_size // 4,
+                                                   batch_size=self.config.data.train_batch_size,
                                                    num_workers=8,
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
@@ -797,7 +797,7 @@ class RayPPOTrainer(object):
 
         # add tqdm
         # FIXME: initial is not fixed
-        num_total_prompts = len(self.train_dataloader) * self.train_dataloader.batch_size
+        num_total_prompts = len(self.train_dataloader.dataset)
         progress_bar = tqdm(total=num_total_prompts, initial=0, desc="Training Progress (Samples)")
 
         # we start from step 1
@@ -807,30 +807,16 @@ class RayPPOTrainer(object):
         is_last_step = False
         for epoch in range(self.config.trainer.total_epochs):
             num_total_checked_prompt = 0
-            is_epoch_ended = False
-            while not is_epoch_ended:
-                timing_raw = {}
-                num_cumulated_nonzero_prompt = 0
-                num_checked_prompt_per_step = 0
-                estimated_prompt_size = min(self.config.data.train_batch_size * self.config.data.max_roll_factor,
-                                            self.config.data.train_batch_size / self.last_prompt_utilization)
-                batch_list = []
-                for batch_dict in self.train_dataloader:
-                    batch: DataProto = DataProto.from_single_dict(batch_dict)
-                    batch_list.append(batch)
-                    num_checked_prompt_per_step += len(batch.batch)
-                    if num_checked_prompt_per_step >= estimated_prompt_size:
-                        break
-
-                batch = DataProto.concat(batch_list)
-
-                num_total_checked_prompt += num_checked_prompt_per_step
-                if num_total_prompts - num_total_checked_prompt <= self.config.data.train_batch_size:
-                    is_epoch_ended = True
-                    if epoch + 1 == self.config.trainer.total_epochs:
-                        is_last_step = True
-
-                metrics = {}
+            num_checked_prompt_per_step = 0
+            num_cumulated_nonzero_prompt = 0
+            total_batch = None
+            num_substeps = 0
+            timing_raw = defaultdict(float)
+            metrics = {}
+            for batch_dict in self.train_dataloader:
+                num_substeps += 1
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                num_checked_prompt_per_step += len(batch.batch)
 
                 # pop those keys for generation
                 if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
@@ -906,7 +892,7 @@ class RayPPOTrainer(object):
                             prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
 
                         kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 1e-5]
-                        num_cumulated_nonzero_prompt = len(kept_prompt_uids)
+                        num_cumulated_nonzero_prompt += len(kept_prompt_uids)
                         kept_traj_idxs = []
                         for idx, traj_from_prompt_uid in enumerate(batch.non_tensor_batch['uid']):
                             if traj_from_prompt_uid in kept_prompt_uids:
@@ -914,16 +900,35 @@ class RayPPOTrainer(object):
 
                         batch = batch[kept_traj_idxs]
 
+                        total_batch = batch if total_batch is None else DataProto.concat([total_batch, batch])
+
+                        # check is last
+                        num_total_checked_prompt += num_checked_prompt_per_step
+                        if num_total_prompts - num_total_checked_prompt <= self.config.data.train_batch_size: # last step in this epoch
+                            is_last_step_this_epoch = True
+                            if epoch + 1 == self.config.trainer.total_epochs: # last epoch
+                                is_last_step = True
+                        else:
+                            is_last_step_this_epoch = False
+
+                        if not is_last_step_this_epoch and (num_cumulated_nonzero_prompt < self.config.data.train_batch_size and num_substeps < 4): # needs more prompts
+                            continue # redo
+                        else: # enough prompts
+                            metrics["train/num_wasted_nonzero_prompt"] = num_cumulated_nonzero_prompt - self.config.data.train_batch_size
+                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                            total_batch = total_batch[:traj_bsz]
+                            num_cumulated_nonzero_prompt = self.config.data.train_batch_size
+
                         metrics["train/num_checked_prompt"] = num_checked_prompt_per_step
                         metrics["train/num_nonzero_prompt"] = num_cumulated_nonzero_prompt
                         self.last_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
                         metrics["train/ratio_nonzero_propmt"] = self.last_prompt_utilization
-
-                        if num_cumulated_nonzero_prompt == 0:
-                            print(
-                                f"Warning: No prompt left after filtering, please check your reward function and filter_groups settings."
-                            )
-                            continue
+                        # reset
+                        batch = total_batch
+                        total_batch = None
+                        num_substeps = 0
+                        num_checked_prompt_per_step = 0
+                        num_cumulated_nonzero_prompt = 0
 
                     batch.batch['response_mask'] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -1006,3 +1011,6 @@ class RayPPOTrainer(object):
 
                 progress_bar.update(num_checked_prompt_per_step)
                 self.global_steps += 1
+
+                timing_raw = defaultdict(float)  # reset timing raw for next step
+                metrics = {}  # reset metrics for next step
